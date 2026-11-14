@@ -1,7 +1,7 @@
 
 #!/bin/bash
 # ==============================================================================
-# Автоустановщик SSH Telegram 2FA (Debian / Ubuntu), версия 2
+# Автоустановщик SSH Telegram 2FA (Debian / Ubuntu), версия 2.1
 #   sudo bash install-2fa.sh              — установка
 #   sudo bash install-2fa.sh --uninstall  — снять защиту (убрать хук из PAM)
 # ==============================================================================
@@ -315,9 +315,9 @@ EOF_PAM
 # --- tg_bot.py ---
 cat << 'EOF_BOT' > "$INSTALL_DIR/tg_bot.py"
 #!/opt/ssh-tg-auth/venv/bin/python
-import os, re, hmac, hashlib, time, glob, html, syslog, logging
+import os, re, hmac, hashlib, time, glob, html, syslog, logging, asyncio, shutil, subprocess
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, BotCommandScopeChat, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
  
 logging.basicConfig(level=logging.WARNING)
@@ -334,7 +334,15 @@ ADMIN_IDS = [x.strip() for x in os.getenv("ADMIN_ID", "").split(",") if x.strip(
 SECRET_KEY = os.getenv("SECRET_KEY", "")
 DISABLE_TTL_MIN = int(os.getenv("DISABLE_TTL_MIN", "15"))
  
-HELP = "\n\nКоманды: /status, /disable [минуты], /enable, /unblock"
+HELP = "\n\nКоманды: /status, /who, /disable [минуты], /enable, /unblock"
+ 
+COMMANDS = [
+    BotCommand("status", "состояние 2FA"),
+    BotCommand("who", "кто сейчас на сервере"),
+    BotCommand("disable", "отключить 2FA на N минут"),
+    BotCommand("enable", "включить 2FA"),
+    BotCommand("unblock", "снять блокировку IP"),
+]
  
  
 def generate_hmac(action, session_id):
@@ -367,6 +375,80 @@ def write_flag(expiry):
     os.replace(tmp, DISABLE_FLAG)
  
  
+# ----------------------------- /who -----------------------------------------
+ 
+def run_cmd(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+ 
+ 
+def fmt_duration(seconds):
+    seconds = int(seconds)
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d} д {h} ч"
+    if h:
+        return f"{h} ч {m} мин"
+    return f"{m} мин" if m else f"{seconds} с"
+ 
+ 
+def ssh_ports():
+    """Порты sshd: переменная SSH_PORTS из .env (необязательно) или sshd -T."""
+    ports = [p for p in re.split(r"[,\s]+", os.getenv("SSH_PORTS", "")) if p.isdigit()]
+    if not ports:
+        sshd = shutil.which("sshd") or "/usr/sbin/sshd"
+        ports = re.findall(r"(?mi)^port (\d+)\s*$", run_cmd([sshd, "-T"]))
+    return sorted(set(ports), key=int) or ["22"]
+ 
+ 
+def build_who():
+    esc = html.escape
+    parts = ["👥 <b>Кто сейчас на сервере</b>"]
+ 
+    # 1. Интерактивные сессии (с терминалом) из utmp
+    who_lines = [l for l in run_cmd(["who"]).splitlines() if l.strip()][:20]
+    parts.append("\n<b>Интерактивные сессии:</b>")
+    parts.append(f"<pre>{esc(chr(10).join(who_lines))}</pre>" if who_lines else "нет")
+ 
+    # 2. Сессии без терминала (scp, rsync, туннели ssh -N) в utmp не попадают
+    notty = []
+    for line in run_cmd(["ps", "-eo", "etimes=,args="]).splitlines():
+        m = re.match(r"^\s*(\d+)\s+sshd: (\S+?)@notty\s*$", line)
+        if m:
+            notty.append((m.group(2), int(m.group(1))))
+    parts.append("\n<b>Без терминала (scp, rsync, туннели):</b>")
+    parts.append("\n".join(f"• {esc(u)} — {fmt_duration(t)}" for u, t in notty[:15]) if notty else "нет")
+ 
+    # 3. Все TCP-подключения к sshd с IP (включая тех, кто ещё не прошёл вход)
+    ports = ssh_ports()
+    expr = ["("]
+    for i, p in enumerate(ports):
+        if i:
+            expr.append("or")
+        expr += ["sport", "=", f":{p}"]
+    expr.append(")")
+    peers = {}
+    for line in run_cmd(["ss", "-H", "-tn", "state", "established"] + expr).splitlines():
+        f = line.split()
+        if len(f) < 2:
+            continue
+        ip = f[-1].rsplit(":", 1)[0].strip("[]")
+        peers[ip] = peers.get(ip, 0) + 1
+    parts.append(f"\n<b>TCP-подключения к SSH (порт {esc(', '.join(ports))}), "
+                 f"включая ещё не вошедших:</b>")
+    parts.append("\n".join(f"• <code>{esc(ip)}</code> — {n}" for ip, n in sorted(peers.items())[:20])
+                 if peers else "нет")
+ 
+    parts.append(f"\n<i>{esc(time.strftime('%Y-%m-%d %H:%M:%S'))}</i>")
+    return "\n".join(parts)
+ 
+ 
+# ----------------------------- команды --------------------------------------
+ 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user):
         return
@@ -378,6 +460,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "🛡 <b>Статус:</b> 2FA включена\nСервер под защитой." + HELP, parse_mode="HTML")
+ 
+ 
+async def cmd_who(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user):
+        return
+    text = await asyncio.to_thread(build_who)
+    await update.message.reply_text(text, parse_mode="HTML")
  
  
 async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,13 +555,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer("Решение применено.")
  
  
+async def post_init(app: Application) -> None:
+    # Меню команд (кнопка «Меню» в чате) только для администраторов.
+    # Работает для тех, кто уже нажал /start у бота; остальным ошибка игнорируется.
+    for admin_id in ADMIN_IDS:
+        try:
+            await app.bot.set_my_commands(COMMANDS, scope=BotCommandScopeChat(chat_id=int(admin_id)))
+        except Exception as e:
+            syslog.syslog(syslog.LOG_WARNING,
+                          f"Не удалось задать меню команд для {admin_id}: {type(e).__name__}")
+ 
+ 
 def main():
     syslog.openlog(ident="ssh-tg-auth-bot", facility=syslog.LOG_AUTH)
     if not (BOT_TOKEN and ADMIN_IDS and SECRET_KEY):
         raise SystemExit("Неполная конфигурация .env")
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_status))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("who", cmd_who))
     app.add_handler(CommandHandler("disable", cmd_disable))
     app.add_handler(CommandHandler("enable", cmd_enable))
     app.add_handler(CommandHandler("unblock", cmd_unblock))
@@ -491,6 +592,7 @@ cat << 'EOF_MD' > "$INSTALL_DIR/README.md"
 # SSH Telegram 2FA
 Команды в Telegram:
 /status           - проверить состояние
+/who              - кто сейчас на сервере (сессии SSH и IP)
 /disable [минуты] - временно отключить 2FA (по умолчанию 15, максимум 60), потом включится сама
 /enable           - включить 2FA сразу
 /unblock          - снять блокировку IP после серии отклонённых/просроченных запросов
@@ -579,6 +681,6 @@ echo -e "${GREEN}✅ УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА!${NC}"
 echo -e "${CYAN}=================================================${NC}"
 echo -e "${YELLOW}ВАЖНО:${NC} не закрывайте эту SSH-сессию. Откройте НОВОЕ окно, подключитесь"
 echo -e "и подтвердите вход в Telegram. Убедитесь, что у вас есть консоль/rescue у хостера."
-echo -e "Команды бота: /status, /disable [мин], /enable, /unblock"
+echo -e "Команды бота: /status, /who, /disable [мин], /enable, /unblock"
 echo -e "Снять защиту: sudo bash $0 --uninstall"
  
